@@ -1,4 +1,3 @@
-Here is the README content rewritten as a **single section** (no separate chapters), suitable for a project submission:
 
 ```markdown
 # CRIU Process Migration (vm2 → vm1)
