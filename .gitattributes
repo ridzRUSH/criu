@@ -1,0 +1,9 @@
+# Commands and scripts run on Linux VMs; Windows line endings break shell heredocs.
+*.txt text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+Dockerfile text eol=lf
