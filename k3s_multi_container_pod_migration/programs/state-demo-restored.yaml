@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: state-demo
+  namespace: migration-demo
+spec:
+  nodeName: infra-demo
+  restartPolicy: Never
+  securityContext:
+    appArmorProfile:
+      type: Unconfined
+  containers:
+  - name: redis
+    image: localhost/ckpt-redis:latest
+    imagePullPolicy: Never
+  - name: flask
+    image: localhost/ckpt-flask:latest
+    imagePullPolicy: Never
+    ports:
+    - containerPort: 8080
+      hostPort: 8080

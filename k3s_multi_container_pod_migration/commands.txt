@@ -1,0 +1,278 @@
+MULTI-CONTAINER POD MIGRATION WITH K3S + CRI-O + CRIU  (vm2 -> infra-demo)
+=========================================================================
+Explanations are in Walk_through.md. Run the blocks in order.
+Each block says which machine it runs on.
+
+vm2         = source, K3s server     192.168.56.102   prompt: vm2@vm2
+infra-demo  = destination (VM1)      192.168.56.101   prompt: vm1@infra-demo
+
+kubectl works ONLY on vm2.
+Cluster checks and network setup: see section A and B of
+../k3s_single_container_pod_migration/commands.txt
+
+
+------------------------------------------------------------------
+1. RESET                                                  (run on vm2)
+------------------------------------------------------------------
+sudo kubectl get nodes
+# both must be Ready
+
+sudo kubectl create namespace migration-demo --dry-run=client -o yaml | sudo kubectl apply -f -
+
+# Old pods can hold hostPort 8080 or reuse the name state-demo.
+sudo kubectl delete pod state-demo flask-counter -n migration-demo --ignore-not-found --wait=true
+
+
+------------------------------------------------------------------
+2. CREATE AND BUILD THE APP                               (run on vm2)
+------------------------------------------------------------------
+# Skip this step and step 3 if the images already exist and their
+# IDs match on both VMs.
+
+mkdir -p ~/state-demo && cd ~/state-demo
+
+cat > app.py <<'EOF'
+from flask import Flask, jsonify
+import uuid, redis
+
+app = Flask(__name__)
+counter = 0
+boot_id = uuid.uuid4().hex
+
+def connect():
+    return redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
+
+# Open and close Redis per request: no TCP connection stays open at checkpoint time.
+@app.route("/")
+def increment():
+    global counter
+    counter += 1
+    r = connect()
+    try:
+        hits = r.incr("hits")
+        r.rpush("log", f"req-{counter}")
+    finally:
+        r.connection_pool.disconnect()
+    return jsonify(counter=counter, redis_hits=hits, boot_id=boot_id)
+
+@app.route("/peek")
+def peek():
+    r = connect()
+    try:
+        hits = int(r.get("hits") or 0)
+        log_len = r.llen("log")
+    finally:
+        r.connection_pool.disconnect()
+    return jsonify(counter=counter, redis_hits=hits, redis_log_len=log_len, boot_id=boot_id)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=False, threaded=False)
+EOF
+
+cat > Dockerfile <<'EOF'
+FROM python:3.12-alpine
+WORKDIR /app
+RUN pip install --no-cache-dir flask redis
+COPY app.py .
+ENV PYTHONUNBUFFERED=1
+CMD ["python3", "-u", "app.py"]
+EOF
+
+# --network=host: the build network can't resolve DNS on these VMs.
+sudo podman build --network=host -t localhost/flask-redis:latest .
+
+sudo podman pull docker.io/library/redis:7-alpine
+
+
+------------------------------------------------------------------
+3. COPY BOTH BASE IMAGES TO infra-demo                    (run on vm2)
+------------------------------------------------------------------
+# podman save won't overwrite a file, and an old tar may hold an old build.
+sudo rm -f /tmp/flask-redis.tar /tmp/redis.tar && sudo podman save -o /tmp/flask-redis.tar localhost/flask-redis:latest && sudo podman save -o /tmp/redis.tar docker.io/library/redis:7-alpine
+
+scp /tmp/flask-redis.tar /tmp/redis.tar vm1@192.168.56.101:/tmp/
+
+ssh -t vm1@192.168.56.101 'sudo podman load -i /tmp/flask-redis.tar && sudo podman load -i /tmp/redis.tar'
+
+# The IDs of flask-redis:latest and redis:7-alpine must match:
+sudo crictl images | grep -E 'flask-redis|library/redis'
+ssh -t vm1@192.168.56.101 'sudo crictl images | grep -E "flask-redis|library/redis"'
+
+# If you rebuild flask-redis later, repeat this step.
+
+
+------------------------------------------------------------------
+4. DEPLOY THE POD ON vm2                                  (run on vm2)
+------------------------------------------------------------------
+cat > ~/state-demo/state-demo.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: state-demo
+  namespace: migration-demo
+spec:
+  nodeName: vm2
+  restartPolicy: Never
+  securityContext:
+    appArmorProfile:
+      type: Unconfined
+  containers:
+  - name: redis
+    image: docker.io/library/redis:7-alpine
+    imagePullPolicy: Never
+    args: ["redis-server", "--save", "", "--appendonly", "no", "--bind", "127.0.0.1"]
+  - name: flask
+    image: localhost/flask-redis:latest
+    imagePullPolicy: Never
+    ports:
+    - containerPort: 8080
+      hostPort: 8080
+EOF
+
+sudo kubectl apply -f ~/state-demo/state-demo.yaml && sudo kubectl wait --for=condition=Ready pod/state-demo -n migration-demo --timeout=90s
+
+sudo kubectl get pod state-demo -n migration-demo -o wide
+# expected: 2/2 Running on vm2
+
+
+------------------------------------------------------------------
+5. CREATE STATE AND RECORD IT                             (run on vm2)
+------------------------------------------------------------------
+for i in $(seq 1 25); do curl -s http://192.168.56.102:8080/ > /dev/null; done
+
+{ date; curl -s http://192.168.56.102:8080/peek; echo; sudo kubectl exec -n migration-demo state-demo -c redis -- redis-cli INFO server | grep run_id; } | tee ~/state-demo/before.txt
+
+# Record: counter, redis_hits, redis_log_len, boot_id, run_id.
+# From now on use only /peek. A request to / changes the values.
+
+
+------------------------------------------------------------------
+6. CONFIRM THE POD IS IDLE                                (run on vm2)
+------------------------------------------------------------------
+sleep 3; sudo kubectl exec -n migration-demo state-demo -c redis -- redis-cli CLIENT LIST
+
+# Expected: exactly ONE line, showing cmd=client|list (this check itself).
+# More lines = Flask still has a connection open; wait and check again.
+
+
+------------------------------------------------------------------
+7. CHECKPOINT BOTH CONTAINERS                             (run on vm2)
+------------------------------------------------------------------
+# One POST per container. Path: namespace / pod / CONTAINER name.
+sudo kubectl create --raw "/api/v1/nodes/vm2/proxy/checkpoint/migration-demo/state-demo/flask" -f /dev/null
+
+sudo kubectl create --raw "/api/v1/nodes/vm2/proxy/checkpoint/migration-demo/state-demo/redis" -f /dev/null
+
+# Trust this listing, not the printed output: one flask and one redis
+# archive with the current time.
+sudo ls -lh /var/lib/kubelet/checkpoints/ | grep state-demo
+
+# The source pod is STILL RUNNING. Don't send requests to /.
+
+
+------------------------------------------------------------------
+8. COPY THE ARCHIVES TO infra-demo                        (run on vm2)
+------------------------------------------------------------------
+sudo bash -c 'cp "$(ls -t /var/lib/kubelet/checkpoints/checkpoint-state-demo_migration-demo-flask-*.tar | head -1)" /tmp/ckpt-flask.tar && cp "$(ls -t /var/lib/kubelet/checkpoints/checkpoint-state-demo_migration-demo-redis-*.tar | head -1)" /tmp/ckpt-redis.tar && chmod 644 /tmp/ckpt-flask.tar /tmp/ckpt-redis.tar'
+
+scp /tmp/ckpt-flask.tar /tmp/ckpt-redis.tar vm1@192.168.56.101:/tmp/
+
+
+------------------------------------------------------------------
+9. CHECK BASE IMAGES, BUILD CARRIERS               (run on infra-demo)
+------------------------------------------------------------------
+# Check the prompt says vm1@infra-demo. Carriers built on vm2 cause
+# ErrImageNeverPull.
+
+# Each checkpoint names the exact base image it needs:
+for c in flask redis; do id=$(tar -xOf /tmp/ckpt-$c.tar config.dump | grep '"rootfsImageRef"' | cut -d'"' -f4); echo "$c needs ${id:0:13}"; sudo crictl images | grep -q "${id:0:13}" && echo "  found" || echo "  MISSING - repeat step 3"; done
+
+# One carrier per container. The annotation value is the CONTAINER name.
+NC=$(sudo buildah from scratch) && sudo buildah add "$NC" /tmp/ckpt-flask.tar / && sudo buildah config --annotation=io.kubernetes.cri-o.annotations.checkpoint.name=flask "$NC" && sudo buildah commit "$NC" localhost/ckpt-flask:latest && sudo buildah rm "$NC"
+
+NC=$(sudo buildah from scratch) && sudo buildah add "$NC" /tmp/ckpt-redis.tar / && sudo buildah config --annotation=io.kubernetes.cri-o.annotations.checkpoint.name=redis "$NC" && sudo buildah commit "$NC" localhost/ckpt-redis:latest && sudo buildah rm "$NC"
+
+sudo crictl images | grep -E 'ckpt-|flask-redis|library/redis'
+# expected: ckpt-flask, ckpt-redis, flask-redis, redis
+
+
+------------------------------------------------------------------
+10. DELETE THE SOURCE AND RESTORE ON infra-demo           (run on vm2)
+------------------------------------------------------------------
+cat > ~/state-demo/state-demo-restored.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: state-demo
+  namespace: migration-demo
+spec:
+  nodeName: infra-demo
+  restartPolicy: Never
+  securityContext:
+    appArmorProfile:
+      type: Unconfined
+  containers:
+  - name: redis
+    image: localhost/ckpt-redis:latest
+    imagePullPolicy: Never
+  - name: flask
+    image: localhost/ckpt-flask:latest
+    imagePullPolicy: Never
+    ports:
+    - containerPort: 8080
+      hostPort: 8080
+EOF
+
+grep -E 'nodeName|image:' ~/state-demo/state-demo-restored.yaml
+# expected: infra-demo, localhost/ckpt-redis, localhost/ckpt-flask
+
+sudo kubectl delete pod state-demo -n migration-demo --wait=true && sudo kubectl apply -f ~/state-demo/state-demo-restored.yaml && sudo kubectl wait --for=condition=Ready pod/state-demo -n migration-demo --timeout=120s
+
+# If the wait times out, go to IF IT FAILS. Don't delete the pod yet.
+
+
+------------------------------------------------------------------
+11. VERIFY AND SAVE THE RESULT                            (run on vm2)
+------------------------------------------------------------------
+# Read-only: doesn't change any values. Save straight away.
+{ date; sudo kubectl get pod state-demo -n migration-demo -o wide; curl -s http://192.168.56.101:8080/peek; echo; sudo kubectl exec -n migration-demo state-demo -c redis -- redis-cli INFO server | grep run_id; } | tee ~/state-demo/result.txt
+
+cat ~/state-demo/before.txt
+
+# SUCCESS when, compared with before.txt:
+#   READY 2/2, NODE infra-demo
+#   counter, redis_hits, redis_log_len  are the same
+#   boot_id and run_id                  are the same
+#   Pod IP changed (expected)
+
+# Then one live request; counter and redis_hits should both go up by 1:
+curl -s http://192.168.56.101:8080/; echo
+
+
+------------------------------------------------------------------
+IF IT FAILS
+------------------------------------------------------------------
+# on vm2 - which container failed, and the error message:
+sudo kubectl get pod state-demo -n migration-demo -o jsonpath='{range .status.containerStatuses[*]}{.name}{" ready="}{.ready}{" "}{.state}{"\n"}{end}'
+sudo kubectl describe pod state-demo -n migration-demo | tail -30
+
+# on infra-demo - CRI-O's log (can come back empty; trust the pod status first):
+sudo journalctl -u crio -n 400 --no-pager | grep -iE 'restor|criu|reserved|level=error' | tail -40
+
+# ErrImageNeverPull         -> carriers missing on infra-demo (step 9)
+# 1/2 CreateContainerError  -> a base image ID missing on infra-demo
+#                              (step 9 check, then step 3)
+# docker-archive doesn't support modifying existing images
+#                           -> the tar already exists; rm -f it (step 3)
+# new boot_id/run_id, counter 0
+#                           -> pod used a base image, not a carrier;
+#                              check image: lines in the restore YAML
+# checkpoint fails with TCP error
+#                           -> a connection was open; repeat step 6
+# Pending                   -> something else holds hostPort 8080
+# Pod "not found" later     -> pod was removed. Carriers still exist,
+#                              so apply state-demo-restored.yaml again.
+
+# Retry only the restore (no new checkpoint needed):
+#   sudo kubectl delete pod state-demo -n migration-demo --ignore-not-found --wait=true
+#   sudo kubectl apply -f ~/state-demo/state-demo-restored.yaml
