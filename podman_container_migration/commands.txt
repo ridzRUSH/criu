@@ -1,0 +1,171 @@
+PODMAN CONTAINER MIGRATION WITH CRIU  (vm2 -> vm1)
+==================================================
+Explanations are in Walk_through.md. Run the blocks in order.
+Each block says which machine it runs on.
+
+vm2 = source       192.168.56.102
+vm1 = destination  192.168.56.101
+
+Use sudo for every podman command. Rootless and rootful podman
+keep separate containers, and rootless podman doesn't work on these VMs.
+
+
+------------------------------------------------------------------
+0. CHECK TOOLS                                      (run on BOTH VMs)
+------------------------------------------------------------------
+podman --version
+sudo criu check
+# expected: "Looks good."
+
+
+------------------------------------------------------------------
+1. ALLOW SHORT IMAGE NAMES                          (run on BOTH VMs)
+------------------------------------------------------------------
+# Lets "node:22-alpine" resolve to Docker Hub. Adds the line at the
+# top of the file only if it isn't already there.
+grep -q '^unqualified-search-registries' /etc/containers/registries.conf || sudo sed -i '1i unqualified-search-registries = ["docker.io"]' /etc/containers/registries.conf
+
+grep '^unqualified-search-registries' /etc/containers/registries.conf
+
+
+------------------------------------------------------------------
+2. CREATE THE APP                                         (run on vm2)
+------------------------------------------------------------------
+mkdir -p ~/Desktop/node-ser && cd ~/Desktop/node-ser
+
+cat > server.js <<'EOF'
+const express = require("express");
+const app = express();
+let cnt = 0;
+
+app.get("/", (req, res) => {
+    cnt++;
+    res.json({ cnt });
+});
+
+app.listen(8080, "0.0.0.0", () => {
+    console.log("Listening on port 8080");
+});
+EOF
+
+cat > package.json <<'EOF'
+{
+  "name": "checkpoint-demo",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
+EOF
+
+cat > Dockerfile <<'EOF'
+FROM node:22-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+EXPOSE 8080
+CMD ["node","server.js"]
+EOF
+
+
+------------------------------------------------------------------
+3. BUILD THE IMAGE                                        (run on vm2)
+------------------------------------------------------------------
+# --network=host: the build's own network can't resolve DNS here,
+# so npm install fails with EAI_AGAIN without it.
+sudo podman build --network=host -t localhost/checkpoint-demo:latest .
+
+
+------------------------------------------------------------------
+4. COPY THE IMAGE TO vm1                                  (run on vm2)
+------------------------------------------------------------------
+# podman save won't overwrite an existing file, so delete it first.
+sudo rm -f /tmp/checkpoint-demo.tar && sudo podman save -o /tmp/checkpoint-demo.tar localhost/checkpoint-demo:latest
+
+scp /tmp/checkpoint-demo.tar vm1@192.168.56.101:/tmp/
+
+# -t gives the remote sudo a terminal so it can ask for the password.
+ssh -t vm1@192.168.56.101 'sudo podman load -i /tmp/checkpoint-demo.tar'
+
+# Compare the IMAGE ID on both VMs. They must match.
+sudo podman images localhost/checkpoint-demo
+ssh -t vm1@192.168.56.101 'sudo podman images localhost/checkpoint-demo'
+
+
+------------------------------------------------------------------
+5. RUN THE CONTAINER                                      (run on vm2)
+------------------------------------------------------------------
+# Remove any old copy, then start with AppArmor unconfined so CRIU
+# has no AppArmor profile to re-apply on restore.
+sudo podman rm -f node-demo 2>/dev/null
+
+sudo podman run -d --name node-demo --security-opt apparmor=unconfined -p 8080:8080 localhost/checkpoint-demo:latest
+
+sudo podman ps
+
+
+------------------------------------------------------------------
+6. CREATE STATE                                           (run on vm2)
+------------------------------------------------------------------
+curl localhost:8080
+curl localhost:8080
+curl localhost:8080
+# Write down the last cnt value. Every request adds one.
+
+# If curl on the host is reset, check from inside the container:
+sudo podman exec node-demo wget -qO- http://127.0.0.1:8080/
+
+
+------------------------------------------------------------------
+7. CHECKPOINT                                             (run on vm2)
+------------------------------------------------------------------
+# Stops the container and writes its whole state to one archive.
+sudo rm -f /tmp/node-demo.tar.gz
+sudo podman container checkpoint --export=/tmp/node-demo.tar.gz --tcp-established node-demo
+
+ls -lh /tmp/node-demo.tar.gz
+
+
+------------------------------------------------------------------
+8. COPY THE ARCHIVE TO vm1                                (run on vm2)
+------------------------------------------------------------------
+sudo chmod 644 /tmp/node-demo.tar.gz
+scp /tmp/node-demo.tar.gz vm1@192.168.56.101:/tmp/
+
+
+------------------------------------------------------------------
+9. RESTORE                                                (run on vm1)
+------------------------------------------------------------------
+# Clear leftovers from any earlier attempt, then restore.
+sudo podman rm -f node-demo 2>/dev/null
+sudo podman container cleanup -a
+
+sudo podman container restore --import=/tmp/node-demo.tar.gz --tcp-established
+
+sudo podman ps
+
+
+------------------------------------------------------------------
+10. VERIFY                                                (run on vm1)
+------------------------------------------------------------------
+curl localhost:8080
+# Expected: one more than the last value from step 6.
+# A value of 1 means the state did not survive.
+
+# From vm2 instead:
+#   curl http://192.168.56.101:8080
+
+
+------------------------------------------------------------------
+IF THE RESTORE FAILS                                      (run on vm1)
+------------------------------------------------------------------
+# Restore stuck or "container init still running":
+ps -ef | grep -E 'criu|conmon' | grep -v grep
+sudo podman rm -f node-demo
+sudo podman container cleanup -a
+# then repeat step 9
+
+# Look for the error:
+sudo podman logs node-demo
+sudo journalctl -n 100 --no-pager | grep -iE 'criu|restore|apparmor'
