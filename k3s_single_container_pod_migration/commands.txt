@@ -1,0 +1,261 @@
+SINGLE-CONTAINER POD MIGRATION WITH K3S + CRI-O + CRIU  (vm2 -> infra-demo)
+==========================================================================
+Explanations are in Walk_through.md. Run the blocks in order.
+Each block says which machine it runs on.
+
+vm2         = source, K3s server     192.168.56.102   prompt: vm2@vm2
+infra-demo  = destination (VM1)      192.168.56.101   prompt: vm1@infra-demo
+
+kubectl works ONLY on vm2.
+
+
+------------------------------------------------------------------
+A. CLUSTER CHECKS                         (one-time, before any run)
+------------------------------------------------------------------
+# --- on vm2 ---
+sudo kubectl get nodes -o wide
+# expected: vm2 and infra-demo Ready, CONTAINER-RUNTIME cri-o://...
+
+# --- on BOTH VMs ---
+sudo criu check
+# expected: Looks good.
+
+crun --version | head -1
+# if missing:  sudo apt install -y crun && sudo systemctl restart crio
+
+sudo crio config 2>/dev/null | grep enable_criu_support
+# expected: enable_criu_support = true
+# if not, add it and restart CRI-O:
+#   printf '[crio.runtime]\nenable_criu_support = true\n' | sudo tee /etc/crio/crio.conf.d/20-criu.conf
+#   sudo systemctl restart crio
+
+# Set the crictl endpoint once, so plain "sudo crictl" talks to CRI-O:
+sudo crictl config --set runtime-endpoint=unix:///var/run/crio/crio.sock --set image-endpoint=unix:///var/run/crio/crio.sock
+
+
+------------------------------------------------------------------
+B. CLUSTER NETWORK SETTINGS        (one-time, only if not already set)
+------------------------------------------------------------------
+# Flannel must use the host-only interface, not the NAT one (10.0.2.15
+# exists on both VMs). On each node, /etc/rancher/k3s/config.yaml holds:
+#     flannel-iface: enp0s8
+# and --node-ip is set ONLY in the K3s systemd override, not in both.
+
+cat /etc/rancher/k3s/config.yaml
+
+# UFW denies routed traffic by default; pod traffic between nodes is
+# routed. Run on each node where "sudo ufw status" says active:
+sudo ufw route allow from 10.42.0.0/16 to 10.42.0.0/16
+sudo ufw allow in on enp0s8 proto udp to any port 8472
+sudo ufw reload
+
+
+------------------------------------------------------------------
+1. RESET                                                  (run on vm2)
+------------------------------------------------------------------
+sudo kubectl create namespace migration-demo --dry-run=client -o yaml | sudo kubectl apply -f -
+
+# Old pods can hold hostPort 8080.
+sudo kubectl delete pod flask-counter state-demo -n migration-demo --ignore-not-found --wait=true
+
+
+------------------------------------------------------------------
+2. CREATE THE APP                                         (run on vm2)
+------------------------------------------------------------------
+mkdir -p ~/flask-counter && cd ~/flask-counter
+
+cat > app.py <<'EOF'
+from flask import Flask, jsonify
+import os, time, uuid
+
+app = Flask(__name__)
+
+counter = 0
+started_at = time.time()
+boot_id = uuid.uuid4().hex
+
+@app.route("/")
+def increment():
+    global counter
+    counter += 1
+    print(f"COUNTER = {counter}", flush=True)
+    return jsonify(counter=counter, boot_id=boot_id, pid=os.getpid(), host=os.uname().nodename)
+
+@app.route("/peek")
+def peek():
+    return jsonify(counter=counter, boot_id=boot_id, pid=os.getpid(), host=os.uname().nodename,
+                   uptime_s=round(time.time() - started_at, 1))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=False, threaded=False)
+EOF
+
+cat > Dockerfile <<'EOF'
+FROM python:3.12-alpine
+WORKDIR /app
+RUN pip install --no-cache-dir flask
+COPY app.py .
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8080
+CMD ["python3", "-u", "app.py"]
+EOF
+
+
+------------------------------------------------------------------
+3. BUILD AND COPY THE IMAGE TO infra-demo                 (run on vm2)
+------------------------------------------------------------------
+sudo podman build --network=host -t localhost/flask-container:latest .
+
+sudo rm -f /tmp/flask-container.tar && sudo podman save -o /tmp/flask-container.tar localhost/flask-container:latest
+
+scp /tmp/flask-container.tar vm1@192.168.56.101:/tmp/
+
+ssh -t vm1@192.168.56.101 'sudo podman load -i /tmp/flask-container.tar'
+
+# IMAGE ID must be the same on both:
+sudo crictl images | grep flask-container
+ssh -t vm1@192.168.56.101 'sudo crictl images | grep flask-container'
+
+# If you rebuild the image later, repeat this whole step.
+
+
+------------------------------------------------------------------
+4. DEPLOY THE POD ON vm2                                  (run on vm2)
+------------------------------------------------------------------
+cat > ~/flask-counter/counter-pod.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: flask-counter
+  namespace: migration-demo
+spec:
+  nodeName: vm2
+  restartPolicy: Never
+  containers:
+  - name: flask-container
+    image: localhost/flask-container:latest
+    imagePullPolicy: Never
+    ports:
+    - containerPort: 8080
+      hostPort: 8080
+    securityContext:
+      appArmorProfile:
+        type: Unconfined
+EOF
+
+sudo kubectl apply -f ~/flask-counter/counter-pod.yaml && sudo kubectl wait --for=condition=Ready pod/flask-counter -n migration-demo --timeout=90s
+
+sudo kubectl get pod flask-counter -n migration-demo -o wide
+# expected: 1/1 Running on vm2
+
+
+------------------------------------------------------------------
+5. CREATE STATE AND RECORD IT                             (run on vm2)
+------------------------------------------------------------------
+for i in $(seq 1 20); do curl -s http://192.168.56.102:8080/ > /dev/null; done
+
+curl -s http://192.168.56.102:8080/peek | tee ~/flask-counter/before.txt; echo
+
+# Write down counter and boot_id.
+# From now on use only /peek. A request to / changes the counter.
+
+
+------------------------------------------------------------------
+6. CHECKPOINT                                             (run on vm2)
+------------------------------------------------------------------
+# POST through the API server to the kubelet on vm2.
+# Path: namespace / pod / CONTAINER name.
+sudo kubectl create --raw "/api/v1/nodes/vm2/proxy/checkpoint/migration-demo/flask-counter/flask-container" -f /dev/null
+# expected: {"items":["/var/lib/kubelet/checkpoints/checkpoint-flask-counter_migration-demo-flask-container-...tar"]}
+
+sudo ls -lh /var/lib/kubelet/checkpoints/ | grep flask-counter
+
+# The source container is STILL RUNNING. It is deleted in step 9.
+
+
+------------------------------------------------------------------
+7. COPY THE ARCHIVE TO infra-demo                         (run on vm2)
+------------------------------------------------------------------
+# Newest archive -> /tmp/ckpt-flask.tar (readable), then send it.
+sudo bash -c 'cp "$(ls -t /var/lib/kubelet/checkpoints/checkpoint-flask-counter_migration-demo-flask-container-*.tar | head -1)" /tmp/ckpt-flask.tar && chmod 644 /tmp/ckpt-flask.tar'
+
+scp /tmp/ckpt-flask.tar vm1@192.168.56.101:/tmp/
+
+
+------------------------------------------------------------------
+8. BUILD THE CARRIER IMAGE                         (run on infra-demo)
+------------------------------------------------------------------
+# Check the prompt says vm1@infra-demo.
+
+# The checkpoint names the exact base image it needs:
+id=$(tar -xOf /tmp/ckpt-flask.tar config.dump | grep '"rootfsImageRef"' | cut -d'"' -f4); echo "needs ${id:0:13}"; sudo crictl images | grep -q "${id:0:13}" && echo "found" || echo "MISSING - repeat step 3"
+
+# Wrap the checkpoint in an empty image marked as a checkpoint.
+# The annotation value is the CONTAINER name.
+NC=$(sudo buildah from scratch) && sudo buildah add "$NC" /tmp/ckpt-flask.tar / && sudo buildah config --annotation=io.kubernetes.cri-o.annotations.checkpoint.name=flask-container "$NC" && sudo buildah commit "$NC" localhost/flask-checkpoint:latest && sudo buildah rm "$NC"
+
+sudo crictl images | grep flask
+# expected: localhost/flask-checkpoint and localhost/flask-container
+
+
+------------------------------------------------------------------
+9. DELETE THE SOURCE AND RESTORE ON infra-demo            (run on vm2)
+------------------------------------------------------------------
+cat > ~/flask-counter/counter-restored.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: flask-counter
+  namespace: migration-demo
+spec:
+  nodeName: infra-demo
+  restartPolicy: Never
+  containers:
+  - name: flask-container
+    image: localhost/flask-checkpoint:latest
+    imagePullPolicy: Never
+    ports:
+    - containerPort: 8080
+      hostPort: 8080
+    securityContext:
+      appArmorProfile:
+        type: Unconfined
+EOF
+
+sudo kubectl delete pod flask-counter -n migration-demo --wait=true && sudo kubectl apply -f ~/flask-counter/counter-restored.yaml && sudo kubectl wait --for=condition=Ready pod/flask-counter -n migration-demo --timeout=120s
+
+
+------------------------------------------------------------------
+10. VERIFY AND SAVE THE RESULT                            (run on vm2)
+------------------------------------------------------------------
+{ date; sudo kubectl get pod flask-counter -n migration-demo -o wide; curl -s http://192.168.56.101:8080/peek; echo; } | tee ~/flask-counter/after.txt
+
+cat ~/flask-counter/before.txt; echo
+
+# SUCCESS when:
+#   NODE is infra-demo, READY 1/1
+#   counter  = the value in before.txt
+#   boot_id  = the value in before.txt
+#   Pod IP changed (expected)
+
+# Then one live request; counter should go up by 1:
+curl -s http://192.168.56.101:8080/; echo
+
+
+------------------------------------------------------------------
+IF IT FAILS
+------------------------------------------------------------------
+# on vm2 - which container failed and why:
+sudo kubectl get pod flask-counter -n migration-demo -o jsonpath='{range .status.containerStatuses[*]}{.name}{" ready="}{.ready}{" "}{.state}{"\n"}{end}'
+sudo kubectl describe pod flask-counter -n migration-demo | tail -30
+
+# on infra-demo - CRI-O's log:
+sudo journalctl -u crio -n 400 --no-pager | grep -iE 'restor|criu|reserved|level=error' | tail -40
+
+# ErrImageNeverPull        -> carrier not built on infra-demo (step 8)
+# CreateContainerError     -> base image missing on infra-demo (step 3)
+# new boot_id / counter 0  -> pod used the base image, not the carrier;
+#                             check image: in counter-restored.yaml
+# Pending                  -> something else holds hostPort 8080
+# Pod "not found" later    -> pod was removed; carrier still exists, so
+#                             just apply counter-restored.yaml again
