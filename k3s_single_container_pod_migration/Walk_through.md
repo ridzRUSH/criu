@@ -48,7 +48,11 @@ CRIU                       freezes, saves and rebuilds the process
 
 The Container Runtime Interface (CRI) has a `CheckpointContainer` call but no restore call. There's no `kubectl restore`.
 
-CRI-O works around this. When a pod uses an image carrying the annotation `io.kubernetes.cri-o.annotations.checkpoint.name`, CRI-O restores the checkpoint inside that image instead of starting a fresh container. K3s's default runtime, containerd, offers no equivalent restore path through Kubernetes, so it could take the checkpoint but not restore it.
+CRI-O works around this. When a pod uses an image carrying the annotation `io.kubernetes.cri-o.annotations.checkpoint.name`, CRI-O restores the checkpoint inside that image instead of starting a fresh container.
+
+containerd, K3s's default runtime, has no built-in equivalent. Restoring a checkpoint through Kubernetes on containerd needs extra components: the [checkpoint-restore-operator](https://github.com/checkpoint-restore/checkpoint-restore-operator) adds a `PodRestore` resource and a CRI proxy that sits between the kubelet and containerd. A related project, [Distributed-Process-Migration-using-CRIU](https://github.com/garvagrawal9084/Distributed-Process-Migration-using-CRIU), used that route.
+
+CRI-O was chosen because it restores natively, with nothing extra to install, run or keep version-compatible. On a two-VM testbed, fewer moving parts also made failures easier to trace.
 
 CRI-O also shares its checkpoint code and its image store (`/var/lib/containers/storage`) with rootful Podman. An image loaded with `sudo podman load` is visible to CRI-O immediately, so no image registry is needed.
 
